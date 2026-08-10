@@ -1,0 +1,1040 @@
+--[[
+    In-game debug tooling for zzz_aaa_stash_stale_id_fix, driven from the F7
+    debug console.
+
+    Why the F7 console and not a UI or an MCM page:
+      debug_cmd_list keeps its command table file-local but hands out a live
+      reference through command_get_list() (debug_cmd_list.script:1-5), and
+      ui_debug_main dispatches straight off it (command_exists at :542,
+      command_give at :587), passing the debug_ui itself as `owner` so a
+      command can write back with owner:SendOutput (:618-643). Adding a command
+      is therefore one table assignment: no ui_debug_main.xml edit, no override
+      of a vanilla script (ui_debug_main and debug_cmd_list are both unopposed
+      `data` winners in the manifest), and nothing for another mod to conflict
+      with.
+
+      The whole thing is gated on DEV_DEBUG, i.e. the -dbg launch argument
+      (_g.script:25-27). That is the same gate F7 itself is behind, since
+      ui_debug_launcher only registers its key handler under DEV_DEBUG
+      (:609-617). So if F7 opens the menu, these commands are there, and if it
+      does not, this file does nothing at all.
+
+    Commands (all under the single `stashfix` word, `stashfix help` lists them):
+
+      audit                 walk treasure_manager.caches and classify every entry
+      list [page]           per-entry detail for the problem entries only
+      blocks                stale ids bucketed by 256-id generator block
+      probe [n]             allocate n ids and report whether ids are really
+                            being freed and reused
+      sweep                 re-run the fix's own sweep on demand
+      status                armed state + whether the fix's hooks are installed
+      arm [n]               stage a real recycling repro: n real boxes, enrolled
+                            then freed (default 8, spread across n blocks)
+      check [n]             burn ids until one of the armed ones comes back as
+                            something that is not a box (same session as arm)
+      disarm                clear the staged repro and release anything it spawned
+
+    How arm/check actually get an id back, and the trap that is easy to fall
+    into:
+
+      Everything here depends on a release *actually freeing the id*, and
+      alife():release() only does that when the object is offline
+      (alife_simulator_script.cpp:298-302). Given an online one it touches the id
+      generator not at all: it posts a GE_DESTROY network event, in a branch
+      commented "awful hack, for stohe only" (:304-310). Churn spawned at the
+      actor's feet is online, so a loop like that frees nothing while it runs. It
+      walks off into virgin id space and never revisits a block, and no armed id
+      can ever come back. Everything below spawns on another level instead,
+      where objects are created offline and released on the spot.
+
+      With real frees in play the generator behaves like this. All 256 blocks
+      start at timestamp 0: CID_Generator's constructor frees the whole range
+      with tStartTime, which is 0 for this instantiation (id_generator.h:84-89,
+      xrServer.h:144-155). tfGetID takes min_element over the blocks (:101), and
+      SID_Block::operator< (:35-38) breaks a tie on the lower index, so
+      allocation starts at the lowest block with room.
+
+      Freeing an id stamps its block with Device.TimerAsync() (xrServer.cpp:873),
+      a large rising number, which moves that block to the back of the queue. So
+      each spawn-and-free steps the allocator on to the next block. Once every
+      block with room has been stamped, the minimum is whichever was stamped
+      *earliest*, and blocks are LIFO (:71), so the first id such a block hands
+      back is the last one freed into it.
+
+      That is the whole mechanism `arm` uses. It spawns real inventory boxes,
+      enrols them in the pool, and frees them, which leaves each id on top of its
+      block with the oldest stamp in the session. `check` then burns ids until
+      the allocator comes round to one of those blocks, and gets an armed id
+      straight back, as a loaf of bread, with the stash pool still listing it
+      as an empty stash.
+
+      This works within one session and is *broken* by reloading. A load builds a
+      fresh generator via clear_ids() (xrServer.h:172-175), which resets every
+      timestamp to 0 and rebuilds each block's stack from scratch, discarding the
+      LIFO position that made the armed id reachable. So: arm, then check, no
+      save in between.
+
+    Everything here writes to the xray log as well as the console, because the
+    console holds 27 lines (ui_debug_main.script:365) and an audit of a
+    ~1200-entry pool does not fit in it.
+
+    Read-only unless you ask otherwise: audit / list / blocks / status only
+    read. probe, arm and check spawn objects and clean up after themselves;
+    arm additionally writes one entry into treasure_manager.caches and releases
+    the box it spawned. Use them on a save you are willing to lose.
+--]]
+
+
+local PREFIX = "stashfix"
+local PAGE = 18                     -- lines of detail per `list` page
+-- How many ids `check` will burn through looking for an armed one. Each is an
+-- offline spawn plus an immediate release, so nothing accumulates, but it is all
+-- on one frame: a few thousand is a visible hitch, not a hang.
+--
+-- The allocator has 256 blocks, and a spawn-plus-free stamps one block and moves
+-- to the next, so a full pass costs a few hundred ids. The default is a couple of
+-- passes' worth.
+local CHECK_DEFAULT = 800
+local CHECK_MAX = 8000
+
+-- Boxes `arm` stages. More than one because a given id only comes back when its
+-- own block is selected; a handful spreads that bet across a handful of blocks
+-- and costs nothing, since they are freed again immediately.
+local ARM_DEFAULT = 8
+local PROBE_DEFAULT = 8
+
+-- Sections `probe` and `check` spawn as throwaway churn. First one that exists
+-- wins; the list is only long because a modlist is free to rename any of them.
+local JUNK = { "bread", "kolbasa", "conserva", "vodka", "medkit", "bandage" }
+local BOX_SECTIONS = { "inventory_box", "hidden_box" }
+
+local SPOTS = { "treasure", "treasure_searched", "treasure_unique" }
+
+-- Staged-repro state. Lives in the save (alife_storage_manager) rather than in
+-- axr_main.config because an armed id only means anything for the save it was
+-- armed in, and the whole point is that it has to survive a reload.
+local m_data = {}
+
+
+------------------------------------------------------------------------------
+-- shared helpers (deliberately a copy of the fix's, not a call into it, so the
+-- audit still works on a save where the fix is not installed, which is how
+-- you measure what it is worth)
+------------------------------------------------------------------------------
+
+local function usable_id(id)
+    return (type(id) == "number") and (id >= 0) and (id < 65535)
+end
+
+
+-- Object-taking cores plus id-taking wrappers, mirroring the fix. collect_audit
+-- needs three or four facts about the same entry and walks the whole pool, so it
+-- fetches the object once through a hoisted alife() and passes it down rather than
+-- calling alife_object (a Lua wrapper that re-reads and re-calls the alife()
+-- global, _g.script:2062-2068) once per fact.
+local function obj_is_box(se_obj)
+    return (se_obj and IsInvbox(nil, se_obj:clsid())) and true or false
+end
+
+
+local function is_stash(id)
+    if not usable_id(id) then
+        return false
+    end
+    return obj_is_box(alife_object(id))
+end
+
+
+local function block_of(id)
+    return math.floor(id / 256)     -- CID_Generator<...,0,65534,256>, xrServer.h:144-155
+end
+
+
+local function describe_obj(id, se_obj)
+    if not usable_id(id) then
+        return "id " .. tostring(id) .. " (not a usable id)"
+    end
+    if not se_obj then
+        return "id " .. tostring(id) .. " (no object)"
+    end
+    local owner = se_obj.parent_id and (se_obj.parent_id ~= 65535) and alife_object(se_obj.parent_id)
+    return "id " .. tostring(id) .. " (" .. tostring(se_obj:section_name())
+        .. (owner and (" inside " .. tostring(owner:section_name())) or "") .. ")"
+end
+
+
+local function describe(id)
+    return describe_obj(id, usable_id(id) and alife_object(id) or nil)
+end
+
+
+local function current_spot(id)
+    if not usable_id(id) then
+        return nil
+    end
+    for i = 1, #SPOTS do
+        if level.map_has_object_spot(id, SPOTS[i]) ~= 0 then
+            return SPOTS[i]
+        end
+    end
+end
+
+
+-- Same bounds check the fix uses: game_graph():vertex() is unchecked pointer
+-- arithmetic (game_graph_inline.h:117-120), so a stale or 65535 vertex has to be
+-- screened by valid_vertex_id before it is read.
+local function obj_level(se_obj)
+    local gvid = se_obj and se_obj.m_game_vertex_id
+    if not gvid then
+        return nil
+    end
+    local gg = game_graph()
+    if not gg:valid_vertex_id(gvid) then
+        return nil
+    end
+    return alife():level_name(gg:vertex(gvid):level_id())
+end
+
+
+local function stash_level(id)
+    if not usable_id(id) then
+        return nil
+    end
+    return obj_level(alife_object(id))
+end
+
+
+local function first_existing(list)
+    for i = 1, #list do
+        if ini_sys:section_exist(list[i]) then
+            return list[i]
+        end
+    end
+end
+
+
+-- A spawn point on some *other* level, cached for the session.
+--
+-- This is not a nicety, it is the thing that makes any of the id work possible.
+-- alife():release() only frees an id straight away when the object is offline
+-- (alife_simulator_script.cpp:298-302). For an online one it does not touch the
+-- id generator at all. It posts a GE_DESTROY network event instead, in a branch
+-- whose own comment reads "awful hack, for stohe only" (:304-310), and the free
+-- lands whenever that event is processed. Spawning churn at the actor's feet
+-- therefore frees nothing during the loop: it just consumes virgin ids and the
+-- allocator never revisits anything, which is exactly the failure this replaced.
+--
+-- An object on another level is outside switch distance, so it is created offline
+-- and released synchronously. It also never touches physics or rendering, which
+-- is what makes a few thousand of them survivable.
+local spawn_point = nil
+
+local function offline_spawn_point()
+    if spawn_point ~= nil then
+        return spawn_point or nil
+    end
+
+    local here = game_graph():vertex(db.actor:game_vertex_id()):level_id()
+    -- No vertex_count export (game_graph_script.cpp:64-70), so walk until
+    -- valid_vertex_id says stop. A different level shows up almost immediately.
+    for g = 0, 65533 do
+        if not game_graph():valid_vertex_id(g) then
+            break
+        end
+        local v = game_graph():vertex(g)
+        if v:level_id() ~= here then
+            spawn_point = { gvid = g, pos = v:level_point(), lvid = v:level_vertex_id() }
+            return spawn_point
+        end
+    end
+
+    spawn_point = false     -- single-level install; cache the miss, don't rescan
+    return nil
+end
+
+
+-- One throwaway object, created offline and destroyed immediately. Returns the id
+-- it briefly held, which is the only thing we actually want from it.
+local function burn_id(sec, at)
+    local se_obj = alife():create(sec, at.pos, at.lvid, at.gvid)
+    if not se_obj then
+        return nil
+    end
+    local id = se_obj.id
+    alife():release(se_obj, true)
+    return id
+end
+
+
+------------------------------------------------------------------------------
+-- output: console and log together
+------------------------------------------------------------------------------
+
+-- SendOutput does its own %s substitution over varargs (ui_debug_main.script
+-- :626-632), so format here and hand it a finished single string. Otherwise a
+-- section name containing a percent sign would be eaten twice.
+local function say(owner, fmt, ...)
+    local line = select("#", ...) > 0 and strformat(fmt, ...) or fmt
+    if owner then
+        owner:SendOutput(line)
+    end
+    printf("~ STASHFIX/dbg| %s", line)
+end
+
+
+------------------------------------------------------------------------------
+-- (A) audit: walk the pool and classify every entry
+------------------------------------------------------------------------------
+
+-- Returns a report table. Split out from the command so `check` and `status`
+-- can reuse it without printing.
+local function collect_audit()
+    local r = {
+        total = 0, boxes = 0, stale = 0, missing = 0,
+        loaded = 0, orphaned = 0, bad_vertex = 0,
+        marked = 0, bogus_marked = 0,
+        problems = {},              -- ordered detail lines
+        stale_blocks = {},          -- block -> count
+    }
+
+    local tm = treasure_manager
+    if not (tm and tm.caches) then
+        r.no_pool = true
+        return r
+    end
+
+    -- Sort the ids so `list` paginates stably across calls; pairs() order is not
+    -- guaranteed to be the same twice.
+    local ids = {}
+    for id in pairs(tm.caches) do
+        ids[#ids + 1] = id
+    end
+    table.sort(ids)
+
+    -- The heaviest loop in either script: every entry costs a fetch, up to three
+    -- map_has_object_spot probes and, for a box, two graph reads. One fetch per
+    -- entry through the hoisted sim, reused by the class test, the level read and
+    -- the detail line, rather than one per fact.
+    local sim = alife()
+
+    for i = 1, #ids do
+        local id = ids[i]
+        local state = tm.caches[id]
+        local se_obj = usable_id(id) and sim:object(id) or nil
+        local spot = current_spot(id)
+        local box = obj_is_box(se_obj)
+
+        r.total = r.total + 1
+        if spot then
+            r.marked = r.marked + 1
+        end
+        if type(state) == "string" then
+            r.loaded = r.loaded + 1
+        end
+
+        if box then
+            r.boxes = r.boxes + 1
+            -- A genuine box is still not automatically safe: set_random_stash
+            -- indexes the game graph with m_game_vertex_id for level tiering
+            -- (treasure_manager.script:372) without checking the vertex, so an
+            -- unusable vertex on a real box is its own defect and the fix
+            -- refuses it without pruning it.
+            if not obj_level(se_obj) then
+                r.bad_vertex = r.bad_vertex + 1
+                r.problems[#r.problems + 1] = strformat(
+                    "bad-vertex %s blk %s state=%s",
+                    describe_obj(id, se_obj), block_of(id),
+                    (type(state) == "string") and "loaded" or tostring(state))
+            end
+        else
+            local kind = se_obj and "stale" or "missing"
+            if se_obj then
+                r.stale = r.stale + 1
+                r.stale_blocks[block_of(id)] = (r.stale_blocks[block_of(id)] or 0) + 1
+            else
+                r.missing = r.missing + 1
+            end
+            if type(state) == "string" then
+                r.orphaned = r.orphaned + 1
+            end
+            if spot then
+                r.bogus_marked = r.bogus_marked + 1
+            end
+            r.problems[#r.problems + 1] = strformat(
+                "%s %s blk %s state=%s spot=%s lvl=%s",
+                kind, describe_obj(id, se_obj), block_of(id),
+                (type(state) == "string") and ("loaded[" .. state .. "]") or tostring(state),
+                tostring(spot), tostring(obj_level(se_obj)))
+        end
+    end
+
+    return r
+end
+
+
+-- Highest id currently in use. Scans down from the top of the range and stops at
+-- the first live object, so it is cheap on a populated world. Used to tell a
+-- fresh allocation (above the high-water mark) from one that filled a hole left
+-- by a dead object, which is the thing that makes recycling possible at all.
+local function max_live_id()
+    for id = 65534, 1, -1 do
+        if alife_object(id) then
+            return id
+        end
+    end
+    return 0
+end
+
+
+local function fix_state()
+    local fix = zzz_aaa_stash_stale_id_fix
+    if not (fix and fix.debug_state) then
+        return nil
+    end
+    return fix.debug_state()
+end
+
+
+local function cmd_audit(owner)
+    local r = collect_audit()
+    if r.no_pool then
+        return "audit := treasure_manager.caches is missing -- nothing to walk"
+    end
+
+    say(owner, "audit := %s pool entries", r.total)
+    say(owner, "  live boxes        : %s", r.boxes)
+    say(owner, "  stale (recycled)  : %s   <- id now belongs to something else", r.stale)
+    say(owner, "  missing (no obj)  : %s", r.missing)
+    say(owner, "  holding loot      : %s   of which orphaned: %s", r.loaded, r.orphaned)
+    say(owner, "  map spots on pool : %s   of which bogus: %s", r.marked, r.bogus_marked)
+    say(owner, "  boxes, bad vertex : %s", r.bad_vertex)
+
+    local st = fix_state()
+    say(owner, "  fix               : %s", st
+        and strformat("hooks=%s swept=%s autosweep=%s",
+            tostring(st.hooked), tostring(st.swept), tostring(st.autosweep))
+        or "not loaded")
+
+    -- A clean pool on a save that was broken five minutes ago is the fix having
+    -- worked, not the bug being absent. Say which, or the audit reads as "there
+    -- was never anything wrong here".
+    if st and st.last then
+        say(owner, "  last sweep        : %s checked, %s dropped, %s of %s relocated",
+            st.last.checked, st.last.dropped, st.last.moved, st.last.orphans)
+    end
+
+    if #r.problems == 0 then
+        if st and st.last and (st.last.dropped > 0) then
+            return "audit := pool is clean -- the sweep above is what cleaned it"
+        end
+        if st and (st.autosweep == false) then
+            return "audit := pool is clean, and autosweep is off -- genuinely nothing wrong"
+        end
+        return "audit := pool is clean"
+    end
+    return strformat("audit := %s problem entries -- '%s list' for detail",
+        #r.problems, PREFIX)
+end
+
+
+local function cmd_list(owner, page)
+    local r = collect_audit()
+    if r.no_pool then
+        return "list := treasure_manager.caches is missing"
+    end
+    if #r.problems == 0 then
+        return "list := no problem entries"
+    end
+
+    page = math.max(1, math.floor(tonumber(page) or 1))
+    local pages = math.ceil(#r.problems / PAGE)
+    if page > pages then
+        return strformat("list := no such page (1..%s)", pages)
+    end
+
+    say(owner, "list := problem entries [%s of %s]", page, pages)
+    for i = (page - 1) * PAGE + 1, math.min(page * PAGE, #r.problems) do
+        say(owner, "  %s", r.problems[i])
+    end
+    return (page < pages)
+        and strformat("list := more on page %s", page + 1)
+        or nil
+end
+
+
+-- Stale ids grouped by generator block. Flat random reuse would scatter them
+-- across 256 blocks; the block-at-a-time allocation described in the header
+-- clusters them, and this is what shows that.
+local function cmd_blocks(owner)
+    local r = collect_audit()
+    if r.no_pool then
+        return "blocks := treasure_manager.caches is missing"
+    end
+    if r.stale == 0 then
+        return "blocks := no stale ids to bucket"
+    end
+
+    local rows = {}
+    for blk, n in pairs(r.stale_blocks) do
+        rows[#rows + 1] = { blk = blk, n = n }
+    end
+    table.sort(rows, function(a, b)
+        return (a.n == b.n) and (a.blk < b.blk) or (a.n > b.n)
+    end)
+
+    say(owner, "blocks := %s stale ids across %s of 256 blocks", r.stale, #rows)
+    for i = 1, math.min(#rows, PAGE) do
+        say(owner, "  block %s (%s..%s) : %s stale",
+            rows[i].blk, rows[i].blk * 256, rows[i].blk * 256 + 255, rows[i].n)
+    end
+end
+
+
+------------------------------------------------------------------------------
+-- probe: is this save recycling id space yet?
+------------------------------------------------------------------------------
+
+-- Allocates a few ids, notes where they landed, and releases them again. An id
+-- below the current high-water mark is one the generator handed back out of a
+-- hole; an id above it is virgin space. A save that only ever allocates virgin
+-- ids cannot produce this bug yet, and `arm` will not fire on it.
+local function cmd_probe(owner, n)
+    if not (level.present() and db.actor) then
+        return "probe := needs to be in-game"
+    end
+
+    local sec = first_existing(JUNK)
+    if not sec then
+        return "probe := no usable junk section -- edit JUNK in this file"
+    end
+
+    local at = offline_spawn_point()
+    if not at then
+        return "probe := found no game vertex on another level to spawn offline at"
+    end
+
+    n = math.min(math.max(1, math.floor(tonumber(n) or PROBE_DEFAULT)), 64)
+
+    local hw = max_live_id()
+    local spawned, recycled, blocks = {}, 0, {}
+
+    for _ = 1, n do
+        local id = burn_id(sec, at)
+        if not id then
+            break
+        end
+        spawned[#spawned + 1] = id
+        blocks[block_of(id)] = true
+        if id < hw then
+            recycled = recycled + 1
+        end
+    end
+
+    local nblocks = 0
+    for _ in pairs(blocks) do
+        nblocks = nblocks + 1
+    end
+
+    say(owner, "probe := %s x %s offline, high-water live id %s", #spawned, sec, hw)
+    say(owner, "  ids     : %s", table.concat(spawned, " "))
+    say(owner, "  blocks  : %s distinct", nblocks)
+    say(owner, "  from holes below high-water: %s of %s", recycled, #spawned)
+
+    -- Each spawn frees its id back with a fresh timestamp, so distinct blocks
+    -- means the allocator is stepping block to block the way it should. All in
+    -- one block would mean the frees are not landing, and nothing else here
+    -- would work either.
+    if nblocks == 1 and #spawned > 2 then
+        return "probe := every id came from one block -- releases are not freeing ids"
+    end
+    if recycled == 0 then
+        return "probe := still allocating virgin ids -- this save may be too young to recycle"
+    end
+    return "probe := id space is being recycled -- 'arm' should work here"
+end
+
+
+------------------------------------------------------------------------------
+-- (C) arm / check: a real recycling repro, straddling a save+reload
+------------------------------------------------------------------------------
+
+-- The armed set: ids that were real, enrolled inventory boxes and are now free.
+-- Plural because one is a single point of failure. An id only comes back when
+-- its block is selected, and arming a handful spreads that across a handful of
+-- blocks for no extra cost.
+local function armed_ids()
+    local out = {}
+    for i = 1, #(m_data.armed or {}) do
+        if usable_id(m_data.armed[i]) then
+            out[#out + 1] = m_data.armed[i]
+        end
+    end
+    return out
+end
+
+
+local function armed()
+    return (#armed_ids() > 0) and armed_ids()[1] or nil
+end
+
+
+local function release_junk()
+    local n = 0
+    for i = 1, #(m_data.junk or {}) do
+        local se_obj = usable_id(m_data.junk[i]) and alife_object(m_data.junk[i])
+        -- Only release it if it is still the thing we spawned. If its id has
+        -- since been handed to something else, which is the entire point of
+        -- this exercise, releasing it would destroy an unrelated object.
+        if se_obj and (se_obj:section_name() == m_data.junk_section) then
+            alife():release(se_obj, true)
+            n = n + 1
+        end
+    end
+    m_data.junk = {}
+    return n
+end
+
+
+-- Take an id out of the pool the way the fix's own drop() does, clearing any spot
+-- with it and keeping treasure_manager's private caches_count in step.
+local function unenrol(id)
+    if not (treasure_manager and treasure_manager.caches
+        and treasure_manager.caches[id] ~= nil) then
+        return false
+    end
+
+    -- Duplicate spots are possible: AddMapLocation has no dup guard
+    -- (map_manager.cpp:123-132) and RemoveMapLocation erases only the first
+    -- match (:159-171).
+    for s = 1, #SPOTS do
+        for _ = 1, 8 do
+            if level.map_has_object_spot(id, SPOTS[s]) == 0 then
+                break
+            end
+            level.map_remove_object_spot(id, SPOTS[s])
+        end
+    end
+
+    -- release_stash_by_id early-returns on a falsy value, so an available entry
+    -- has to be made truthy before it will act on it.
+    if type(treasure_manager.release_stash_by_id) == "function" then
+        if not treasure_manager.caches[id] then
+            treasure_manager.caches[id] = true
+        end
+        treasure_manager.release_stash_by_id(id)
+    end
+    treasure_manager.caches[id] = nil
+    return true
+end
+
+
+local function cmd_arm(owner, n)
+    if not (level.present() and db.actor) then
+        return "arm := needs to be in-game"
+    end
+    if armed() then
+        return strformat("arm := already armed (%s ids) -- '%s disarm' first",
+            #armed_ids(), PREFIX)
+    end
+    if not (treasure_manager and treasure_manager.caches) then
+        return "arm := treasure_manager.caches is missing"
+    end
+
+    local sec = first_existing(BOX_SECTIONS)
+    if not sec then
+        return "arm := no spawnable inventory box section found"
+    end
+    local at = offline_spawn_point()
+    if not at then
+        return "arm := found no game vertex on another level to spawn offline at"
+    end
+
+    n = math.min(math.max(1, math.floor(tonumber(n) or ARM_DEFAULT)), 64)
+
+    local ids, blocks = {}, {}
+    for _ = 1, n do
+        local se_obj = alife():create(sec, at.pos, at.lvid, at.gvid)
+        if not se_obj then
+            break
+        end
+        if not IsInvbox(nil, se_obj:clsid()) then
+            alife():release(se_obj, true)
+            return strformat("arm := %s is not an inventory box class", sec)
+        end
+
+        local id = se_obj.id
+        -- Enrol exactly the way on_game_load would have: available, no contents.
+        -- caches_count is a file-local in treasure_manager so it cannot be kept
+        -- in step from out here; it ends up low until these are released again
+        -- through release_stash_by_id, and it only ever feeds `> 0` / `<= 0`
+        -- tests (the pool rebuild guard at treasure_manager.script:626 among
+        -- them), so the drift is inert. `disarm` puts it back.
+        treasure_manager.caches[id] = false
+        ids[#ids + 1] = id
+        blocks[block_of(id)] = true
+
+        -- Offline, so this frees the id here and now rather than posting a
+        -- GE_DESTROY for later. That is what leaves the id on top of its block's
+        -- stack, which is what makes `check` able to get it back.
+        alife():release(se_obj, true)
+    end
+
+    if #ids == 0 then
+        return strformat("arm := failed to spawn %s", sec)
+    end
+
+    local nblocks = 0
+    for _ in pairs(blocks) do
+        nblocks = nblocks + 1
+    end
+
+    m_data.armed = ids
+    m_data.armed_section = sec
+    m_data.junk = {}
+
+    say(owner, "arm := %s x %s spawned offline, enrolled, released", #ids, sec)
+    say(owner, "  ids    : %s", table.concat(ids, " "))
+    say(owner, "  blocks : %s distinct", nblocks)
+    say(owner, "  each id is now free and sitting on top of its block's stack")
+    return strformat("arm := now run '%s check' -- same session, do NOT reload", PREFIX)
+end
+
+
+local function cmd_check(owner, n)
+    local targets = armed_ids()
+    if #targets == 0 then
+        return strformat("check := nothing armed -- '%s arm' first", PREFIX)
+    end
+    if not (level.present() and db.actor) then
+        return "check := needs to be in-game"
+    end
+
+    local want = {}
+    for i = 1, #targets do
+        want[targets[i]] = true
+    end
+
+    -- Any of them already reissued, from ordinary play since arming?
+    for i = 1, #targets do
+        local se_obj = alife_object(targets[i])
+        if se_obj and not IsInvbox(nil, se_obj:clsid()) then
+            say(owner, "check := REPRODUCED without churn -- %s", describe(targets[i]))
+            return strformat("check := '%s audit' now counts it stale; '%s sweep' clears it",
+                PREFIX, PREFIX)
+        end
+    end
+
+    local sec = first_existing(JUNK)
+    if not sec then
+        return "check := no usable junk section -- edit JUNK in this file"
+    end
+    local at = offline_spawn_point()
+    if not at then
+        return "check := found no game vertex on another level to spawn offline at"
+    end
+
+    n = math.min(math.max(1, math.floor(tonumber(n) or CHECK_DEFAULT)), CHECK_MAX)
+
+    -- Spawn offline and release at once, so the id really is freed on the spot
+    -- rather than queued as a GE_DESTROY. Each free stamps that block with
+    -- Device.TimerAsync() (xrServer.cpp:873), which pushes the allocator on to
+    -- the next block; once every block with room has been stamped, the oldest
+    -- stamp wins, and the armed blocks are the oldest because `arm` stamped them
+    -- before any of this ran. Blocks are LIFO (id_generator.h:71), so the first
+    -- id an armed block gives back is the armed one.
+    -- Not burn_id here: the object that lands on an armed id has to *survive*.
+    -- It is the bug, an ordinary item holding an id the stash pool still lists
+    -- as an empty stash, and releasing it would leave the entry pointing at
+    -- nothing, which audits as "missing" rather than "stale" and demonstrates a
+    -- different, milder defect than the one being reproduced.
+    local hit, spawned, blocks = nil, 0, {}
+    for _ = 1, n do
+        local se_obj = alife():create(sec, at.pos, at.lvid, at.gvid)
+        if not se_obj then
+            break
+        end
+        spawned = spawned + 1
+        local id = se_obj.id
+        blocks[block_of(id)] = true
+        if want[id] then
+            hit = id
+            break
+        end
+        alife():release(se_obj, true)
+    end
+
+    local nblocks = 0
+    for _ in pairs(blocks) do
+        nblocks = nblocks + 1
+    end
+
+    say(owner, "check := %s ids burned through %s distinct blocks", spawned, nblocks)
+
+    if not hit then
+        local armed_blocks = {}
+        for i = 1, #targets do
+            armed_blocks[#armed_blocks + 1] = block_of(targets[i])
+                .. (blocks[block_of(targets[i])] and "*" or "")
+        end
+        say(owner, "  none of the %s armed ids came back", #targets)
+        say(owner, "  armed blocks (* = visited): %s", table.concat(armed_blocks, " "))
+        if nblocks <= 2 and spawned > 8 then
+            say(owner, "  the allocator is not moving between blocks -- ids are not")
+            say(owner, "  being freed. Run '%s probe' before trying again.", PREFIX)
+        end
+        return strformat("check := not reproduced -- try '%s check %s'",
+            PREFIX, math.min(n * 4, CHECK_MAX))
+    end
+
+    -- The winner stays: it *is* the bug state, and inspecting it is the point.
+    -- It is an ordinary junk item now, holding an id the stash pool still lists.
+    m_data.junk = { hit }
+    m_data.junk_section = sec
+
+    -- The armed ids that did *not* come back are free ids with no object on
+    -- them, and leaving them enrolled would audit as "missing (no obj)": a
+    -- real category, but not the one being demonstrated, and manufactured
+    -- entirely by this tool. Drop them so the pool carries exactly one injected
+    -- fault and the audit reads clean apart from it.
+    local tidied = 0
+    for i = 1, #targets do
+        if (targets[i] ~= hit) and unenrol(targets[i]) then
+            tidied = tidied + 1
+        end
+    end
+    m_data.armed = { hit }
+
+    say(owner, "check := REPRODUCED after %s ids -- %s", spawned, describe(hit))
+    say(owner, "  caches[%s] = %s", hit,
+        tostring(treasure_manager and treasure_manager.caches
+            and treasure_manager.caches[hit]))
+    if tidied > 0 then
+        say(owner, "  dropped %s unused armed entries, leaving just this one", tidied)
+    end
+    return strformat("check := '%s audit' now counts it stale; '%s sweep' clears it",
+        PREFIX, PREFIX)
+end
+
+
+local function cmd_disarm(owner)
+    local targets = armed_ids()
+    local freed = release_junk()
+    local cleared = 0
+
+    for i = 1, #targets do
+        if unenrol(targets[i]) then
+            cleared = cleared + 1
+        end
+    end
+
+    m_data.armed = {}
+    m_data.armed_section = nil
+    m_data.junk = {}
+
+    return strformat("disarm := cleared %s of %s armed entries, released %s object(s)",
+        cleared, #targets, freed)
+end
+
+
+local function cmd_sweep(owner)
+    local fix = zzz_aaa_stash_stale_id_fix
+    if not (fix and fix.debug_force_sweep) then
+        return "sweep := the fix is not loaded (no debug_force_sweep)"
+    end
+    local ok, why = fix.debug_force_sweep()
+    if not ok then
+        return strformat("sweep := refused -- %s", tostring(why))
+    end
+    say(owner, "sweep := done, see the log for the per-entry detail")
+    return cmd_audit(owner)
+end
+
+
+------------------------------------------------------------------------------
+-- flags: the reason the audit is worth running at all
+------------------------------------------------------------------------------
+
+-- Without these the audit can only ever report a clean pool: the fix sweeps off
+-- actor_on_first_update, which is long finished by the time F7 can be opened.
+-- Turning autosweep off defers the repair until you ask for it, so you can look
+-- at the damage first. The flags live in axr_options.ltx, not the save, because
+-- they must be in effect before the load they apply to.
+local FLAGS = "stashfix"
+
+local function set_flag(owner, key, arg, what)
+    arg = string.lower(arg or "")
+
+    if not (axr_main and axr_main.config) then
+        return strformat("%s := axr_main.config is unavailable", key)
+    end
+
+    if (arg ~= "on") and (arg ~= "off") then
+        local st = fix_state()
+        return strformat("%s := currently %s ('%s %s on|off')",
+            key,
+            st and tostring(st[key]) or "unknown (fix not loaded)",
+            PREFIX, key)
+    end
+
+    axr_main.config:w_value(FLAGS, key, arg == "on")
+    axr_main.config:save()
+
+    say(owner, "%s := %s -- %s", key, arg, what)
+    return strformat("%s := reload the save for this to take effect", key)
+end
+
+
+local function cmd_autosweep(owner, arg)
+    return set_flag(owner, "autosweep", arg,
+        (string.lower(arg or "") == "off")
+            and "the pool will be left unrepaired on load; sweep it by hand"
+            or "the pool is repaired automatically on load (normal)")
+end
+
+
+local function cmd_fix(owner, arg)
+    return set_flag(owner, "enabled", arg,
+        (string.lower(arg or "") == "off")
+            and "the whole fix goes inert: no hooks, no sweep"
+            or "the fix runs normally")
+end
+
+
+local function cmd_status(owner)
+    local st = fix_state()
+    if not st then
+        say(owner, "status := fix NOT loaded")
+    else
+        say(owner, "status := fix loaded, hooks=%s swept=%s", tostring(st.hooked), tostring(st.swept))
+        say(owner, "  flags: enabled=%s autosweep=%s", tostring(st.enabled), tostring(st.autosweep))
+        if st.last then
+            say(owner, "  last sweep: %s checked, %s dropped, %s of %s relocated",
+                st.last.checked, st.last.dropped, st.last.moved, st.last.orphans)
+        else
+            say(owner, "  last sweep: has not run this session")
+        end
+    end
+
+    local targets = armed_ids()
+    if #targets == 0 then
+        return "status := nothing armed"
+    end
+
+    say(owner, "  armed: %s ids spawned as %s", #targets, tostring(m_data.armed_section))
+    local reproduced = 0
+    for i = 1, math.min(#targets, PAGE) do
+        local id = targets[i]
+        local se_obj = alife_object(id)
+        local bad = se_obj and not IsInvbox(nil, se_obj:clsid())
+        if bad then
+            reproduced = reproduced + 1
+        end
+        say(owner, "  %s blk %s pool=%s %s", describe(id), block_of(id),
+            treasure_manager and treasure_manager.caches
+                and tostring(treasure_manager.caches[id]) or "n/a",
+            bad and "<- RECYCLED" or "")
+    end
+    say(owner, "  objects held: %s", #(m_data.junk or {}))
+
+    if reproduced > 0 then
+        return strformat("status := %s armed id(s) recycled onto non-boxes -- reproduced", reproduced)
+    end
+    return "status := armed, not yet reproduced"
+end
+
+
+------------------------------------------------------------------------------
+-- command registration
+------------------------------------------------------------------------------
+
+local USAGE = {
+    "audit             classify every entry in treasure_manager.caches",
+    "list [page]       detail lines for the problem entries",
+    "blocks            stale ids bucketed by 256-id generator block",
+    "status            hooks, flags, last sweep, staged repro",
+    "autosweep on|off  off = don't repair on load, so the audit can see damage",
+    "fix on|off        off = whole mod inert, for measuring a save without it",
+    "sweep             run the pool repair now",
+    "probe [n]         are ids really being freed and reused",
+    "arm [n]           stage a repro: n real boxes, enrolled then freed",
+    "check [n]         burn ids until an armed one returns (same session!)",
+    "disarm            clear the staged repro and clean up",
+}
+
+
+local HANDLERS = {
+    audit     = function(owner) return cmd_audit(owner) end,
+    list      = cmd_list,
+    blocks    = function(owner) return cmd_blocks(owner) end,
+    status    = function(owner) return cmd_status(owner) end,
+    autosweep = cmd_autosweep,
+    fix       = cmd_fix,
+    sweep     = function(owner) return cmd_sweep(owner) end,
+    probe     = cmd_probe,
+    arm       = cmd_arm,
+    check     = cmd_check,
+    disarm    = function(owner) return cmd_disarm(owner) end,
+}
+
+
+-- Signature is the one command_give hands over: (name, args, debug_ui, parsed).
+-- Whatever we return is passed to SendOutput as the closing line (:587).
+local function on_command(me, txt, owner, p)
+    local sub, rest = string.match(tostring(txt or ""), "^(%S*)%s*(.*)$")
+    sub = string.lower(sub or "")
+
+    if (sub == "") or (sub == "help") then
+        say(owner, "%s := subcommands", PREFIX)
+        for i = 1, #USAGE do
+            say(owner, "  %s", USAGE[i])
+        end
+        return nil
+    end
+
+    local handler = HANDLERS[sub]
+    if not handler then
+        return strformat("%s := unknown subcommand '%s' -- try '%s help'", PREFIX, sub, PREFIX)
+    end
+    return handler(owner, rest)
+end
+
+
+-- Persisted so `disarm` still works if you do save and reload mid-repro. The
+-- repro itself does not want a reload, which resets the id generator, but
+-- leaving enrolled-and-freed ids in a save with no way to clean them up would be
+-- worse than the bug being tested.
+local function save_state(data)
+    local live = ((m_data.armed and #m_data.armed > 0)
+        or (m_data.junk and #m_data.junk > 0)) and true or false
+    data.stashfix_debug = live and m_data or nil
+end
+
+
+local function load_state(data)
+    m_data = data.stashfix_debug or {}
+    m_data.armed = m_data.armed or {}
+    m_data.junk = m_data.junk or {}
+end
+
+
+function on_game_start()
+    -- -dbg only. Without it there is no F7 menu to put a command into
+    -- (ui_debug_launcher.script:609-617) and nothing here should exist.
+    if not DEV_DEBUG then
+        return
+    end
+
+    RegisterScriptCallback("save_state", save_state)
+    RegisterScriptCallback("load_state", load_state)
+
+    if not (debug_cmd_list and debug_cmd_list.command_get_list) then
+        printf("! STASHFIX/dbg| debug_cmd_list is missing -- no F7 console command registered")
+        return
+    end
+
+    -- command_get_list hands back the live table by reference, so this is the
+    -- whole of the integration. Re-registering on a -keep_lua reload just
+    -- overwrites the same key.
+    debug_cmd_list.command_get_list()[PREFIX] = on_command
+    printf("~ STASHFIX/dbg| F7 console command '%s' registered", PREFIX)
+end

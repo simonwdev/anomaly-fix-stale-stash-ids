@@ -1,0 +1,807 @@
+--[[
+    Fix Stale Stash IDs: stop Anomaly attaching loot and a map marker to an object
+    that is not a stash. Such a marker can never be opened and never goes away.
+    Also repairs saves that already carry one.
+
+    Every line number here is vanilla Anomaly 1.5.3, from tools\_unpacked\scripts.
+    A mod that overrides one of these files will renumber it; find the function by
+    name instead.
+
+    The defect, all of it stock:
+      treasure_manager holds its candidate pool in `caches`, keyed by server object
+      id. on_game_load (:626) builds it once by walking ids 1..65534 and enrolling
+      every object IsInvbox accepts (:640), guarded by `if (caches_count > 0) then
+      return end`. An available box is stored as `false` (:643; the comment at :299
+      says so outright).
+
+      release_stash_by_id (:602-607) guards on the value, not the key:
+
+          function release_stash_by_id(id)
+              if id and caches[id] then       -- false for every available box
+                  caches[id] = nil
+                  caches_count = caches_count - 1
+              end
+          end
+
+      So the one thing it exists to remove is the one thing it declines to touch.
+      Its single caller is game_setup.script:411-419, which releases every object
+      named in new_game_setup.ltx [remove_objects] and calls the pruner for the
+      inventory boxes among them. Three of those 146 entries are boxes, so every
+      campaign starts with three entries pointing at ids the engine has already
+      taken back.
+
+      Ordering makes that certain rather than occasional. load_state runs from the
+      engine's CALifeStorageManager_load, before on_game_load is sent from
+      bind_stalker_ext:61, so caches_count is already positive on a load and the
+      walk only ever happens on a new game. game_setup then releases the three
+      boxes on actor_on_first_update and the prune no-ops.
+
+      The engine treats an id as a slot handle, not an identity:
+      xrServer::entity_Destroy returns it to a free pool (xrServer.cpp:873 ->
+      id_generator.h:106) and it is reissued later, so a stale entry eventually
+      names a live object that is not a box. Reuse is not uniform: the generator is
+      256 blocks of 256 ids and takes from the block with the oldest free timestamp
+      (xrServer.h:144-155, id_generator.h:35-38,101), which is why this is rare
+      rather than constant. A box cannot be destroyed any other way: CInventoryBox
+      is a plain CGameObject with no CPHDestroyable or CDamageManager
+      (InventoryBox.h:6), so only an explicit script release frees one.
+
+      Nothing downstream checks class. get_random_stash self-heals an id whose
+      object is *gone* (:320-325), which is why the bug needs a recycled id rather
+      than merely a released one, but its class filter is opt-in on inv_box
+      (:288-296) and almost no caller sets it. set_random_stash checks nothing at
+      all: it fetches the object only to read m_game_vertex_id for tiering, then
+      writes the contents string and adds the map spot. Once a marker lands on a
+      non-box it is permanent, because try_spawn_treasure (:512) only runs from
+      physic_object_on_use_callback, gated on IsInvbox (:708-711).
+
+      Matching stash *names* cannot substitute for the class test. An id recycled
+      onto a cooking kit does not carry the name of the box that used to own it,
+      and a name list cannot notice that an id changed hands.
+
+    What this does. One callback and three wrappers, all on treasure_manager. The
+    numbers are used in the comments at each install site:
+
+        (1) the sweep, on actor_on_first_update
+        (2) treasure_manager.get_random_stash
+        (3) treasure_manager.set_random_stash
+        (4) treasure_manager.release_stash_by_id
+
+      (1) Walks the pool once per session and drops every entry whose id is no
+          longer an inventory box, clearing any bogus map spot with it. An entry
+          that was holding loot has its contents and marker moved onto a real box
+          first, preferring the level the bogus marker was on. This is what
+          repairs an existing save.
+
+          Relocation runs before pruning, and `swept` is set on entry so a failure
+          never retries: pruning first would leave a contents string deleted from
+          caches and held only in a local. Candidates are screened against the
+          doomed set explicitly, so a bogus id cannot become another's
+          replacement. The move writes caches directly rather than re-entering
+          set_random_stash, so contents are not re-rolled and no news fires; the
+          hint is rebuilt from the new box's own strings, which costs a relocated
+          treasure_unique its bespoke text.
+
+      (2) Validates the id base drew. A bad draw is dropped and redrawn with
+          inv_box forced on, so a caller can never receive a non-box. Validating
+          after the fact rather than forcing the filter on every call matters:
+          base's filter block runs before the cheap `v == false` test (:288-299),
+          so it pays alife_object + clsid + name for the whole pool including the
+          filled entries the next line discards. Checking the one id that came
+          back is a single lookup. Re-calling is safe because get_random_stash has
+          nothing to undo: it sets a file-local, may prune a dead id, and returns
+          strings. The map spot is attached later, by set_random_stash.
+
+      (3) Refuses an id that is not a box before it can attach loot or a marker,
+          and drops the entry. This is what covers the reserve-now-apply-later
+          callers, which pick an id and commit it much later. It also refuses a
+          real box whose m_game_vertex_id would not survive the graph read at
+          :372, which is guarded against a missing object but not a bad vertex;
+          that refusal keeps the entry, because the box belongs in the pool.
+
+      (4) Makes the pruner able to prune. Promoting a present-but-`false` value to
+          `true` before delegating is the whole fix: the vanilla body then removes
+          the key and decrements its own file-local caches_count, which no wrapper
+          can do directly.
+
+          This is the only hook that changes behaviour on a well-formed call: one
+          that is a silent no-op in vanilla now removes the entry, which is what
+          every caller is asking for, game_setup's "Clear inventory boxes from
+          their manager" included. (2) and (3) diverge from base only when handed
+          an id that is not a box, which is exactly where base produced the bug.
+
+          It earns its place over leaving this to (1) because of ordering. Both
+          run on actor_on_first_update and axr_main stores intercepts as
+          intercepts[name][fn] = true (axr_main.script:249-261), a table keyed by
+          the function object, so their order is unspecified. If (1) runs first on
+          a new game it reports a clean pool and the entries game_setup then seeds
+          survive the session. Fixing the pruner removes the entry at the moment
+          of release instead. No map spot is cleared here, unlike drop(): the case
+          this newly enables is a `false` entry, and treasure_manager only raises a
+          spot when it writes contents.
+
+    Why there is no server_entity_on_unregister hook:
+      Pruning on unregister is the tidy root fix and is not safe from a mod. The
+      callback that would reach an inventory box is the se_* script class:
+      CInventoryBox binds to se_item.se_invbox, whose on_unregister sends it
+      (se_item.script:390-392), and CALifeObjectRegistry's destructor calls
+      on_unregister on every object it holds (alife_object_registry.cpp:17-27). A
+      hook there would empty the pool during teardown, and any save written after
+      that would persist an empty pool. That trades an occasional bogus stash for
+      every stash in the game. (The other sender, alife_release, never fires for a
+      box: _ALIFE_UNREGISTER lists only outfit, device, PDA, food and attachment
+      classes, class_registrator.script:137-145.)
+
+    Not fixed here, on purpose:
+      A refusal at (3) does not substitute a fresh stash, so that reward is not
+      issued. Nothing obtainable is lost, since the alternative was a marker on an
+      object that cannot be opened, but on the PDA contact path the miss is
+      permanent: ui_pda_npc_tab discards the return value and sets
+      stash_read = true regardless (:696-701). Only (1) relocates loot, and only
+      (1) can, because it acts on damage that already exists, where a contents
+      string is already sitting in the pool. (3) is handed an id whose reward does
+      not exist yet. Both point-of-use paths print the contents before erasing them, so a
+      discarded stash is recoverable by hand from the log.
+
+      A bad game vertex on a real box is only screened at (3). get_random_stash
+      dereferences the drawn object's m_game_vertex_id bare at :328, and
+      box_in_valid_map does the same for every candidate at :597, both before (2)
+      sees a return value. Such an entry is a genuine box and belongs in the pool,
+      so the sweep leaves it; zzz_stashfix_debug's `audit` counts them separately
+      as bad-vertex.
+--]]
+
+
+local SPOTS = { "treasure", "treasure_searched", "treasure_unique" }
+
+local swept = false
+local hooked = false
+local last_report = nil
+
+
+-- Debug flags, read from axr_options.ltx. Both default to on, so a normal
+-- install never touches them and nothing here changes for a player who does not
+-- know they exist. zzz_stashfix_debug's F7 console writes them; they live in the
+-- user config rather than in the save because they have to be in effect *before*
+-- the load they apply to, and because the point of them is to compare the same
+-- save with the fix on and off.
+--
+-- axr_main.config is constructed at file scope (axr_main.script:15), so it is
+-- readable this early. r_value's third argument is the type, where 1 is bool.
+--
+--   autosweep = false   pool repair on load is skipped; the point-of-use hooks
+--                       stay on. This is what makes the audit useful: without
+--                       it the sweep has already run by the time you can open
+--                       the F7 console, and the pool is always clean.
+--   enabled   = false   the whole mod is inert. No hooks, no sweep. For
+--                       measuring a save as it would be without this installed.
+local FLAGS = "stashfix"
+
+local function flag(key)
+    if not (axr_main and axr_main.config) then
+        return true
+    end
+    return axr_main.config:r_value(FLAGS, key, 1, true) ~= false
+end
+
+
+-- alife_object logs a full callstack for a nil or out-of-range id
+-- (_g.script:2062-2067), so screen ids before they reach it.
+local function usable_id(id)
+    return (type(id) == "number") and (id >= 0) and (id < 65535)
+end
+
+
+-- Object-taking cores, and thin id-taking wrappers over them.
+--
+-- Re-fetching the same server object is the most repeated cost in this file. Every
+-- loop below needs two or three facts about one entry, and a test that fetched for
+-- itself would cost three alife_object calls to screen a single relocation
+-- candidate. alife_object is a Lua wrapper whose only job is the
+-- bounds guard usable_id has already done, and it reads and calls the alife()
+-- global on every invocation (_g.script:2062-2068), so each fetch is a Lua call
+-- plus two luabind crossings.
+--
+-- So the loops hoist alife() once, fetch once with sim:object(id), and pass the
+-- object to the obj_* functions. The id-taking wrappers stay for the point-of-use
+-- hooks, which handle one id per call and where a fetch is not worth threading.
+--
+-- IsInvbox is kept rather than inlined to `clsid() ~= clsid.inventory_box_s`. It
+-- covers both the _s and client variants (_g.script:2943-2948) and is what
+-- treasure_manager builds the pool with, so the two agree by construction; the
+-- one Lua call it costs is noise next to the luabind clsid() crossing inside it.
+local function obj_is_box(se_obj)
+    return (se_obj and IsInvbox(nil, se_obj:clsid())) and true or false
+end
+
+
+-- True only if this ID currently belongs to an inventory box. Deliberately the
+-- same test treasure_manager builds the pool with, so the two agree. For a
+-- server object clsid() is always the _s variant, so this matches
+-- get_random_stash's stricter `~= clsid.inventory_box_s` exactly.
+local function is_stash(id)
+    if not usable_id(id) then
+        return false
+    end
+    return obj_is_box(alife_object(id))
+end
+
+
+-- Describe an ID for the log. Stale entries are the interesting case, so name
+-- what the ID actually is now rather than just reporting a number.
+local function describe_obj(id, se_obj)
+    if not usable_id(id) then
+        return "id " .. tostring(id) .. " (not a usable id)"
+    end
+    if not se_obj then
+        return "id " .. tostring(id) .. " (no object)"
+    end
+    local owner = se_obj.parent_id and (se_obj.parent_id ~= 65535) and alife_object(se_obj.parent_id)
+    return "id " .. tostring(id) .. " (" .. tostring(se_obj:section_name())
+        .. (owner and (" inside " .. tostring(owner:section_name())) or "") .. ")"
+end
+
+
+local function describe(id)
+    return describe_obj(id, usable_id(id) and alife_object(id) or nil)
+end
+
+
+-- Which treasure spot, if any, is currently attached to this ID.
+-- level.map_* take a u16 (level_script.cpp:412,428,474), so screen the id here
+-- too rather than relying on every caller having done it.
+local function current_spot(id)
+    if not usable_id(id) then
+        return nil
+    end
+    for i = 1, #SPOTS do
+        if level.map_has_object_spot(id, SPOTS[i]) ~= 0 then
+            return SPOTS[i]
+        end
+    end
+end
+
+
+-- CGameGraph::vertex is unchecked pointer arithmetic, `return m_nodes +
+-- vertex_id` (game_graph_inline.h:117-120), with no VERIFY of its own at all;
+-- the nearest ones guard accessible() (:86,:92), and valid_vertex_id is right
+-- there at :96-98 exported to Lua (game_graph_script.cpp:67) and simply not
+-- used. treasure_manager gets away with calling it bare because it believes
+-- every ID it holds is a live box; we call it on IDs we already know are
+-- something else, whose m_game_vertex_id may be stale or the 65535 sentinel, so
+-- the read has to be bounds-checked first.
+local function obj_level(se_obj)
+    local gvid = se_obj and se_obj.m_game_vertex_id
+    if not gvid then
+        return nil
+    end
+    local gg = game_graph()
+    if not gg:valid_vertex_id(gvid) then
+        return nil
+    end
+    return alife():level_name(gg:vertex(gvid):level_id())
+end
+
+
+local function stash_level(id)
+    if not usable_id(id) then
+        return nil
+    end
+    return obj_level(alife_object(id))
+end
+
+
+-- Marker hint for a box, built the way treasure_manager builds it: from the box's
+-- own st_<name>_name / _descr strings, with level_prefix
+-- substituted. Falls back to "", which is what treasure_manager passes when the
+-- translations are missing, leaving the spot's default hint in place.
+local function stash_hint(id)
+    if not usable_id(id) then
+        return ""
+    end
+    local se_obj = alife_object(id)
+    if not se_obj then
+        return ""
+    end
+
+    local name = se_obj:name()
+    local lvl = obj_level(se_obj)
+    if lvl and string.find(name, "level_prefix") then
+        name = string.gsub(name, "level_prefix", lvl, 1)
+    end
+
+    local name_key, descr_key = "st_" .. name .. "_name", "st_" .. name .. "_descr"
+    local name_str = game.translate_string(name_key)
+    local descr_str = game.translate_string(descr_key)
+    if (name_str ~= name_key) and (descr_str ~= descr_key) then
+        return "%c[255,255,160,0]" .. name_str .. "\\n%c[default]" .. descr_str
+    end
+    return ""
+end
+
+
+-- Every empty, genuinely-still-a-box entry that orphaned loot could be moved
+-- into, with the level each one sits on. An empty entry that is still a box, plus
+-- treasure_manager's own blacklisted-map filter. base applies that filter only when
+-- no_spot is falsy (:299, `no_spot or box_in_valid_map(id)`); applying it
+-- unconditionally here is deliberately stricter, so a relocated treasure_unique
+-- will not land on a blacklisted map even though it could have started on one.
+--
+-- box_in_valid_map does the same unchecked game_graph():vertex() read that
+-- stash_level guards against (:597), so a candidate whose
+-- m_game_vertex_id is stale or the 65535 sentinel must be dropped *before* it is
+-- offered to that function. A nil from stash_level is exactly that test, and
+-- the level it returns is the one the same-level preference needs anyway.
+--
+-- The by-name blacklist get_random_stash applies when inv_box is set
+-- (caches_blacklist, :410) cannot be mirrored: it is a file-local. on_game_load
+-- already excludes blacklisted names when building the pool (:642), so the only
+-- exposure is an entry inherited from a save made before a name was
+-- blacklisted.
+--
+-- Built once per sweep rather than once per orphan. Screening a candidate costs an
+-- alife_object lookup plus two graph reads, so a per-orphan rescan of the
+-- ~1200-entry pool put five figures of luabind calls on the frame that runs the
+-- sweep. Drawing from a prebuilt list is pure Lua.
+--
+-- One fetch per entry, through the hoisted sim: the class test and the level read
+-- both take the object. box_in_valid_map fetches it a second time and that cannot
+-- be avoided, since the blacklisted_maps table it consults is a treasure_manager
+-- file-local, and knowing the level here is not enough to apply the filter. Its
+-- `type(valid_map) == "function"` guard is hoisted too; it cannot change mid-loop.
+local function collect_candidates(exclude)
+    local tm = treasure_manager
+    local valid_map = tm.box_in_valid_map
+    local has_valid_map = (type(valid_map) == "function")
+    local sim = alife()
+    local out, n = {}, 0
+
+    for id, state in pairs(tm.caches) do
+        if (state == false) and not exclude[id] and usable_id(id) then
+            local se_obj = sim:object(id)
+            if obj_is_box(se_obj) then
+                local lvl = obj_level(se_obj)
+                if lvl and ((not has_valid_map) or valid_map(id)) then
+                    n = n + 1
+                    out[n] = { id = id, lvl = lvl }
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+
+-- Draw one candidate, preferring the level the bogus marker was sitting on so
+-- the stash stays on the map the player was already heading to; falls back to
+-- anywhere in the pool. Marks what it returns, so two orphans can never be
+-- given the same box.
+local function take_candidate(pool, want_level)
+    local same, any = {}, {}
+
+    for i = 1, #pool do
+        local c = pool[i]
+        if not c.taken then
+            any[#any + 1] = i
+            if want_level and (c.lvl == want_level) then
+                same[#same + 1] = i
+            end
+        end
+    end
+
+    local list = (#same > 0) and same or ((#any > 0) and any)
+    if not list then
+        return nil
+    end
+
+    local c = pool[list[math.random(#list)]]
+    c.taken = true
+    return c.id
+end
+
+
+-- CMapManager::AddMapLocation has no duplicate guard, unlike
+-- AddRelationLocation, which R_ASSERTs on one (map_manager.cpp:123-132 vs :147),
+-- so the same (spot_type, id) pair can be present more than once, and
+-- RemoveMapLocation erases only the first match it finds (:159-171). So raise a
+-- spot only when there isn't one, and remove in a loop.
+local function raise_spot(id, spot, hint)
+    if not usable_id(id) then
+        return
+    end
+    if level.map_has_object_spot(id, spot) == 0 then
+        level.map_add_object_spot_ser(id, spot, hint or "")
+    end
+end
+
+
+local function clear_spot(id, spot)
+    if not usable_id(id) then
+        return
+    end
+    for _ = 1, 8 do
+        if level.map_has_object_spot(id, spot) == 0 then
+            return
+        end
+        level.map_remove_object_spot(id, spot)
+    end
+end
+
+
+-- Remove an entry from the pool, clearing any map spot it managed to acquire.
+local function drop(id)
+    local tm = treasure_manager
+    local state = tm.caches[id]
+    if state == nil then
+        return
+    end
+
+    for i = 1, #SPOTS do
+        clear_spot(id, SPOTS[i])
+    end
+
+    -- release_stash_by_id keeps treasure_manager's private caches_count in step
+    -- with the table, which we cannot do ourselves, since caches_count is a
+    -- file-local. It early-returns on a falsy value though, so an available
+    -- (false) entry has to be made truthy before it will act on it.
+    --
+    -- Hook 6 wraps that function to do the same promotion, so this one is
+    -- normally redundant and idempotent: the wrapper sees `true` and delegates
+    -- straight through. Kept because drop() must not depend on (4) having
+    -- been installed, and because promoting here costs one table write.
+    if type(tm.release_stash_by_id) == "function" then
+        if not state then
+            tm.caches[id] = true
+        end
+        tm.release_stash_by_id(id)
+    end
+
+    -- Belt and braces: if release_stash_by_id was missing or replaced by
+    -- something that did not remove the key, drop it directly. caches_count is
+    -- then one too high, which only ever feeds `> 0` / `<= 0` tests.
+    if tm.caches[id] ~= nil then
+        tm.caches[id] = nil
+    end
+end
+
+
+-- drop() as the point-of-use hooks want it: identical, except that it names any
+-- contents it is about to erase.
+--
+-- A stale entry whose state is a string is loot the player may already have been
+-- told about, and release_stash_by_id deletes the entry outright, so once it is
+-- gone the string is not recoverable from anywhere. The sweep relocates that case
+-- and prints the contents when it cannot; these hooks bin it (see "Not fixed
+-- here, on purpose"), so printing is the only thing standing between a discarded
+-- stash and no record of it at all.
+--
+-- Unreachable from the get_random_stash hook, where the state is always false
+-- because that is the only thing base draws. Used there anyway, for one table
+-- read, so that all three hooks discard the same way rather than two of them
+-- doing it quietly.
+local function drop_in_use(id)
+    local state = treasure_manager.caches[id]
+    if type(state) == "string" then
+        printf("! STASHFIX| the entry being dropped was holding loot -- discarded: %s", state)
+    end
+    drop(id)
+end
+
+
+-- Revalidate the whole pool. ~1200 alife_object calls, once per session, against
+-- the 65534-iteration walk treasure_manager already does on a new game.
+local function do_sweep()
+    if swept then
+        return
+    end
+    swept = true
+
+    local tm = treasure_manager
+    if not (tm and tm.caches) then
+        return
+    end
+
+    -- Collect before mutating; drop() writes to the table we are walking. Capture
+    -- everything a bogus stash needs relocating (contents, spot type, level)
+    -- while its entry and marker still exist.
+    -- One fetch per entry, reused by all four facts a doomed entry needs. sim is
+    -- hoisted for the same reason: alife() is a global read plus a luabind call,
+    -- and this loop runs the length of the pool.
+    local checked = 0
+    local sim = alife()
+    local doomed, orphaned = {}, {}
+    for id, state in pairs(tm.caches) do
+        checked = checked + 1
+        local se_obj = usable_id(id) and sim:object(id) or nil
+        if not obj_is_box(se_obj) then
+            doomed[#doomed + 1] = id
+            if type(state) == "string" then
+                orphaned[#orphaned + 1] = {
+                    id       = id,
+                    contents = state,
+                    spot     = current_spot(id),
+                    lvl      = obj_level(se_obj),
+                    was      = describe_obj(id, se_obj),
+                }
+            end
+        end
+    end
+
+    -- Say so even when there is nothing to do. Otherwise a healthy save is
+    -- indistinguishable from the mod not being loaded at all, which is the
+    -- likelier of the two given it installs as an MO2 junction that has to be
+    -- refreshed and ticked by hand.
+    if #doomed == 0 then
+        last_report = { checked = checked, dropped = 0, orphans = 0, moved = 0 }
+        printf("~ STASHFIX| swept stash pool: %s entries checked, no stale ids", checked)
+        return
+    end
+
+    local excluded = {}
+    for i = 1, #doomed do
+        excluded[doomed[i]] = true
+    end
+
+    -- Relocate orphaned loot into a real box rather than binning it: write the
+    -- contents string across unchanged and re-raise the same spot type on the new
+    -- box.
+    --
+    -- This runs before the stale entries are pruned, not after. A stale entry is
+    -- inert either way, since nothing can draw it while this loop is running, but
+    -- a contents string that has been removed from caches exists only in the local
+    -- above, and `swept` was set on entry, so an error anywhere in here would take
+    -- it with it and never retry. Candidates are screened against `excluded`
+    -- rather than by having already been removed from the table, so a bogus id
+    -- still cannot be chosen as another's replacement.
+    local moved = 0
+    local candidates = (#orphaned > 0) and collect_candidates(excluded) or nil
+    for i = 1, #orphaned do
+        local o = orphaned[i]
+        local new_id = take_candidate(candidates, o.lvl)
+        if new_id then
+            tm.caches[new_id] = o.contents
+            -- Only re-raise a marker if the bogus entry had one. An unmarked stash
+            -- (the no_spot callers) should stay unmarked after the move.
+            if o.spot then
+                raise_spot(new_id, o.spot, stash_hint(new_id))
+            end
+            moved = moved + 1
+            printf("~ STASHFIX| moved orphaned stash loot: %s -> %s%s", o.was,
+                describe(new_id), o.spot and "" or " (no marker, was unmarked)")
+        else
+            printf("! STASHFIX| no valid box left to move loot from %s -- discarded: %s",
+                o.was, o.contents)
+        end
+    end
+
+    for i = 1, #doomed do
+        drop(doomed[i])
+    end
+
+    last_report = { checked = checked, dropped = #doomed, orphans = #orphaned, moved = moved }
+
+    printf("~ STASHFIX| swept stash pool: %s entries checked, dropped %s stale %s, relocated %s of %s bogus %s",
+        checked, #doomed, (#doomed == 1) and "entry" or "entries",
+        moved, #orphaned, (#orphaned == 1) and "stash" or "stashes")
+end
+
+
+-- What actor_on_first_update actually calls. Separated from do_sweep so the
+-- autosweep flag suppresses the automatic run without also disabling a manual
+-- one. `swept` is deliberately left clear here, so the pool is untouched and
+-- still sweepable rather than marked done.
+local function sweep_on_load()
+    if not flag("autosweep") then
+        printf("! STASHFIX| autosweep is OFF (debug flag in axr_options.ltx [%s]): "
+            .. "pool left unrepaired. Run 'stashfix sweep' in the F7 console, or "
+            .. "'stashfix autosweep on' and reload to restore normal behaviour.", FLAGS)
+        return
+    end
+    do_sweep()
+end
+
+
+-- Debug entry points, used by zzz_stashfix_debug's F7 console command. Nothing
+-- in normal play calls any of them.
+--
+-- Clearing `swept` from outside is safe because do_sweep sets it again on entry,
+-- so a forced run is still one-shot with respect to itself. It bypasses the
+-- autosweep flag on purpose: that flag exists to defer the sweep until you ask
+-- for it, and this is the asking.
+function debug_force_sweep()
+    -- Refuse while the mod is flagged off. Sweeping would repair the pool the
+    -- flag exists to leave alone, and it would do it with the point-of-use hooks
+    -- absent, a state that never occurs in a real install, so anything measured
+    -- from it would be measuring nothing.
+    if not flag("enabled") then
+        return false, "the fix is flagged off (enabled=false) -- 'stashfix fix on' and reload first"
+    end
+    swept = false
+    do_sweep()
+    return true
+end
+
+
+function debug_state()
+    return {
+        hooked = hooked,
+        swept = swept,
+        enabled = flag("enabled"),
+        autosweep = flag("autosweep"),
+        -- What the last sweep did, so a session that repaired itself normally
+        -- can still report it after the fact. The audit alone would just see
+        -- the clean pool that was left behind.
+        last = last_report,
+    }
+end
+
+
+-- Wrapping happens in on_game_start rather than at file scope so it lands on top
+-- of anything that patched treasure_manager at load time. Mods that do so exist,
+-- though in practice they patch set_random_stash, try_spawn_treasure or
+-- init_settings rather than get_random_stash.
+--
+-- axr_main.on_game_start loads every script in its first loop before calling any
+-- on_game_start in its second (axr_main.script:307-327), so every file-scope
+-- wrapper is already in place by the time this runs. The loading is not
+-- something that loop does explicitly: it only reads _G[file_name] to test for
+-- an on_game_start. That read is what loads the script: _G carries a lazy-load
+-- __index which calls process_file_if_exists on a miss (script_engine.cpp
+-- :348,356). Outermost is where the validation has to be.
+--
+-- The name is not what secures that. on_game_start dispatch is alphabetical by
+-- filename and ~60 enabled scripts sort after zzz_aaa_. None of them touch
+-- treasure_manager today, so this is outermost in practice, but the prefix buys
+-- uniqueness rather than lastness.
+function on_game_start()
+    -- Debug kill switch, checked before anything else is touched: no wrappers,
+    -- no sweep callback, nothing. This is how you measure a save as it would be
+    -- without the mod, without unticking it in MO2 and losing the F7 console
+    -- along with it. Loud, because an inert fix that looks installed is exactly
+    -- the failure this line exists to make impossible to miss.
+    if not flag("enabled") then
+        printf("! STASHFIX| DISABLED by debug flag in axr_options.ltx [%s] enabled=false "
+            .. "-- no hooks, no sweep. 'stashfix fix on' in the F7 console + reload to re-enable.", FLAGS)
+        return
+    end
+
+    local tm = treasure_manager
+    if not (tm and tm.caches and tm.get_random_stash and tm.set_random_stash) then
+        printf("! STASHFIX| inactive: treasure_manager is missing or has an unexpected shape")
+        return
+    end
+
+    -- Normally the Lua state is rebuilt on every load. CALifeSimulator's ctor
+    -- runs restart_all(), which calls script_engine().init()
+    -- (alife_simulator.cpp:28-48), so these locals reset and on_game_start
+    -- wraps exactly once. The -keep_lua launch flag skips that (:30), leaving a
+    -- persistent state where on_game_start runs again: without these two guards
+    -- the wrappers would stack a layer per load and the sweep would never run a
+    -- second time.
+    --
+    -- Registration sits outside the once-only block on purpose. It does not need
+    -- to be repeated, since a persistent Lua state keeps the registry too, but
+    -- axr_main.callback_set stores intercepts[name][fn] = true (axr_main.script
+    -- :249-261), a set keyed by the function object, so re-registering the same
+    -- upvalue is a no-op. Doing it unconditionally makes the callback's presence
+    -- independent of whether the state was rebuilt, rather than inferred from it.
+    -- This is the only registration in the file; there is nothing to repeat at
+    -- the end of it.
+    RegisterScriptCallback("actor_on_first_update", sweep_on_load)
+
+    swept = false
+    if hooked then
+        return
+    end
+    hooked = true
+
+    -- (4) release_stash_by_id: make it able to prune the entries it is asked about.
+    -- Vanilla guards on the value, `if id and caches[id]`
+    -- (_unpacked/scripts/treasure_manager.script:602-607), and an available box
+    -- is stored as `false` (:643), so the one thing it exists to remove is the
+    -- one thing it declines to touch. Promoting to truthy first is the whole
+    -- repair: the vanilla body then deletes the key and decrements its own
+    -- file-local caches_count, which is the part no wrapper can do directly.
+    --
+    -- This is the only hook that changes behaviour another mod can see. It is
+    -- what the callers already ask for, vanilla game_setup.script:411-419
+    -- included, so it restores intent rather than redefining it.
+    local base_release_stash_by_id = tm.release_stash_by_id
+    if type(base_release_stash_by_id) == "function" then
+        tm.release_stash_by_id = function(id)
+            -- Only ever promote a key that is already there. Writing to an
+            -- absent id would enrol a stash instead of removing one.
+            if usable_id(id) and (tm.caches[id] == false) then
+                tm.caches[id] = true
+            end
+            return base_release_stash_by_id(id)
+        end
+    end
+
+    -- (2) get_random_stash: never hand a stale entry to a caller. Validate what base
+    -- drew and only fall back to its own candidate filter when the draw was
+    -- actually bad, rather than forcing that filter on unconditionally.
+    --
+    -- The filter is expensive and mostly wasted. Its block runs before the cheap
+    -- `v == false` availability test (:288-299), so with inv_box on it pays
+    -- alife_object + clsid() + name() for every entry in the ~1200-entry pool,
+    -- including the filled ones the next line discards. That is ~3600 luabind
+    -- calls per stash award, on top of the box_in_valid_map and
+    -- box_in_same_map lookups the loop already does, each of which fetches the
+    -- object again. Stale entries are a fraction of a percent of the pool, so
+    -- nearly every one of those calls proves something we could have proved with
+    -- one lookup after the fact.
+    --
+    -- Validating the result costs exactly one alife_object on the common path. A
+    -- bad draw drops the entry and re-calls with inv_box = true, paying the full
+    -- filter only when it has been earned. The guarantee is unchanged: a caller
+    -- can still never receive an id that is not an inventory box.
+    --
+    -- Safe to re-call because get_random_stash has no side effects to undo. It
+    -- sets last_secret (rewritten by the retry), prunes an id whose object is gone
+    -- (:320-325), and returns strings. The map spot is attached later and
+    -- separately, by set_random_stash.
+    --
+    -- No behaviour change on the clean path: base is called with the same
+    -- arguments and its return values are handed back untouched. In particular
+    -- the caches_blacklist by-name test is not lost, because it sits inside
+    -- base's own `if inv_box then` branch (:288-296) and so never ran for a
+    -- falsy-inv_box call in vanilla either; the redraw applies it, since that
+    -- call forces inv_box on. The only difference a caller can observe is that
+    -- one which would have been handed a stale id now gets whatever the strict
+    -- redraw finds, possibly nil.
+    local base_get_random_stash = tm.get_random_stash
+    tm.get_random_stash = function(no_spot, hint, spawn_local, inv_box)
+        -- A caller that asks for the filter itself gets it, unchanged and
+        -- unvalidated: it already guarantees a box.
+        if inv_box then
+            return base_get_random_stash(no_spot, hint, spawn_local, inv_box)
+        end
+
+        local id, a, b, c = base_get_random_stash(no_spot, hint, spawn_local, inv_box)
+        if (id == nil) or is_stash(id) then
+            return id, a, b, c
+        end
+
+        printf("! STASHFIX| stash draw landed on a non-box: %s -- dropping it and redrawing", describe(id))
+        if usable_id(id) and tm.caches[id] ~= nil then
+            drop_in_use(id)
+        end
+        return base_get_random_stash(no_spot, hint, spawn_local, true)
+    end
+
+    -- (3) set_random_stash: refuse to attach loot or a marker to an ID that is not
+    -- a box any more.
+    -- Returning nil is what set_random_stash itself returns when it assigns
+    -- nothing, so callers that check the result already handle this.
+    local base_set_random_stash = tm.set_random_stash
+    tm.set_random_stash = function(no_spot, hint, bonus_items, id, dbg)
+        -- The debug simulation passes synthetic counter values, not real IDs.
+        if not dbg then
+            -- Both checks below want the same server object, so fetch it once.
+            local se_obj = usable_id(id) and alife_object(id) or nil
+
+            if not obj_is_box(se_obj) then
+                printf("! STASHFIX| refused to place a stash on a non-box: %s", describe_obj(id, se_obj))
+                if usable_id(id) and tm.caches[id] ~= nil then
+                    drop_in_use(id)
+                end
+                return
+            end
+
+            -- A real box is not automatically a safe argument. set_random_stash
+            -- indexes the game graph with se_obj.m_game_vertex_id for level
+            -- tiering (:372). That read is guarded against a missing object but
+            -- not against a bad vertex, so a box whose vertex is stale or the
+            -- 65535 sentinel is an out-of-bounds read in there. Same guard the
+            -- relocation candidates get, for the same reason. No drop: the entry
+            -- is a genuine inventory box and belongs in the pool.
+            if not obj_level(se_obj) then
+                printf("! STASHFIX| refused a box with an unusable game vertex: %s", describe_obj(id, se_obj))
+                return
+            end
+        end
+        return base_set_random_stash(no_spot, hint, bonus_items, id, dbg)
+    end
+end
